@@ -88,3 +88,172 @@
 (define-read-only (get-user-active-loans (user principal))
     (map-get? UserLoans { user: user }))
 
+
+
+
+;; Request loan
+(define-public (request-loan (amount uint) (collateral uint) (duration uint))
+    (let
+        ((sender tx-sender)
+         (loan-id (+ (var-get next-loan-id) u1))
+         (user-score (unwrap! (map-get? UserScores { user: sender }) ERR-UNAUTHORIZED))
+         (active-loans (default-to { active-loans: (list ) } (map-get? UserLoans { user: sender }))))
+
+        ;; Validate request
+        (asserts! (>= (get score user-score) MIN-LOAN-SCORE) ERR-INSUFFICIENT-SCORE)
+        (asserts! (<= (len (get active-loans active-loans)) u5) ERR-ACTIVE-LOAN)
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+
+        ;; Calculate required collateral based on credit score
+        (let ((required-collateral (calculate-required-collateral amount (get score user-score))))
+            (asserts! (>= collateral required-collateral) ERR-INSUFFICIENT-BALANCE)
+
+            ;; Transfer collateral
+            (try! (stx-transfer? collateral sender (as-contract tx-sender)))
+
+            ;; Create loan
+            (map-set Loans
+                { loan-id: loan-id }
+                {
+                    borrower: sender,
+                    amount: amount,
+                    collateral: collateral,
+                    due-height: (+ stacks-block-height duration),
+                    interest-rate: (calculate-interest-rate (get score user-score)),
+                    is-active: true,
+                    is-defaulted: false,
+                    repaid-amount: u0
+                })
+
+            ;; Update user loans
+            (try! (update-user-loans sender loan-id))
+
+            ;; Transfer loan amount
+            (as-contract (try! (stx-transfer? amount tx-sender sender)))
+
+            ;; Update counters
+            (var-set next-loan-id loan-id)
+            (var-set total-stx-locked (+ (var-get total-stx-locked) collateral))
+
+            (ok loan-id))))
+
+;; Admin functions
+(define-public (mark-loan-defaulted (loan-id uint))
+    (let ((loan (unwrap! (map-get? Loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND)))
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+        (asserts! (>= stacks-block-height (get due-height loan)) ERR-NOT-DUE)
+        (asserts! (get is-active loan) ERR-LOAN-NOT-FOUND)
+
+        ;; Update loan status
+        (map-set Loans
+            { loan-id: loan-id }
+            (merge loan { 
+                is-defaulted: true,
+                is-active: false
+            }))
+
+        ;; Update credit score
+        (try! (update-credit-score (get borrower loan) false loan))
+        (ok true)))
+
+
+
+
+
+;; Repay loan
+(define-public (repay-loan (loan-id uint) (amount uint))
+    (let
+        ((sender tx-sender)
+         (loan (unwrap! (map-get? Loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND)))
+
+        (asserts! (is-eq sender (get borrower loan)) ERR-UNAUTHORIZED)
+        (asserts! (get is-active loan) ERR-LOAN-NOT-FOUND)
+        (asserts! (not (get is-defaulted loan)) ERR-LOAN-DEFAULTED)
+
+        ;; Calculate total amount due
+        (let ((total-due (calculate-total-due loan)))
+            (asserts! (>= amount u0) ERR-INVALID-AMOUNT)
+
+            ;; Transfer repayment
+            (try! (stx-transfer? amount sender (as-contract tx-sender)))
+
+            ;; Update loan
+            (let ((new-repaid-amount (+ (get repaid-amount loan) amount)))
+                (map-set Loans
+                    { loan-id: loan-id }
+                    (merge loan {
+                        repaid-amount: new-repaid-amount,
+                        is-active: (< new-repaid-amount total-due)
+                    }))
+
+                ;; If loan fully repaid, update score and return collateral
+                (if (>= new-repaid-amount total-due)
+                    (begin
+                        (try! (update-credit-score sender true loan))
+                        (as-contract (try! (stx-transfer? (get collateral loan) tx-sender sender)))
+                        (var-set total-stx-locked (- (var-get total-stx-locked) (get collateral loan))))
+                    true)
+
+                (ok true)))))
+
+
+
+(define-private (calculate-total-due (loan {
+        borrower: principal,
+        amount: uint,
+        collateral: uint,
+        due-height: uint,
+        interest-rate: uint,
+        is-active: bool,
+        is-defaulted: bool,
+        repaid-amount: uint
+    }))
+    (let ((interest (* (get amount loan) (get interest-rate loan))))
+        (+ (get amount loan) (/ interest u100))))
+
+(define-private (update-credit-score (user principal) (success bool) (loan {
+        borrower: principal,
+        amount: uint,
+        collateral: uint,
+        due-height: uint,
+        interest-rate: uint,
+        is-active: bool,
+        is-defaulted: bool,
+        repaid-amount: uint
+    }))
+    (let ((current-score (unwrap! (map-get? UserScores { user: user }) ERR-UNAUTHORIZED))
+          (new-score (if success 
+                        (if (<= (+ (get score current-score) u2) MAX-SCORE)
+                            (+ (get score current-score) u2)
+                            MAX-SCORE)
+                        (if (>= (- (get score current-score) u10) MIN-SCORE)
+                            (- (get score current-score) u10)
+                            MIN-SCORE))))
+
+        (if success
+            (map-set UserScores
+                { user: user }
+                (merge current-score {
+                    score: new-score,
+                    total-repaid: (+ (get total-repaid current-score) (get amount loan)),
+                    loans-repaid: (+ (get loans-repaid current-score) u1),
+                    last-update: stacks-block-height
+                }))
+            (map-set UserScores
+                { user: user }
+                (merge current-score {
+                    score: new-score,
+                    last-update: stacks-block-height
+                })))
+        (ok true)))
+
+(define-private (update-user-loans (user principal) (loan-id uint))
+    (let ((user-loans (default-to { active-loans: (list ) }
+            (map-get? UserLoans { user: user }))))
+        (map-set UserLoans
+            { user: user }
+            { active-loans: (unwrap! (as-max-len? 
+                (append (get active-loans user-loans) loan-id) u20)
+                ERR-ACTIVE-LOAN) })
+        (ok true)))
+
